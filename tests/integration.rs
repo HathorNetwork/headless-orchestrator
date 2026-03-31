@@ -661,3 +661,255 @@ async fn test_fund_and_transfer() {
     destroy_session(&c, &session_alice).await;
     destroy_session(&c, &session_bob).await;
 }
+
+// ============================================================================
+// Token Tests
+// ============================================================================
+
+/// Helper: create a token and return (token_uid, token_hash).
+async fn create_custom_token(
+    c: &Client,
+    session: &Session,
+    wallet_id: &str,
+    address: &str,
+    name: &str,
+    symbol: &str,
+    amount: i64,
+) -> (String, String) {
+    let create_resp: Value = c
+        .post(api_url(session, "/wallet/create-token"))
+        .header("X-Wallet-Id", wallet_id)
+        .json(&json!({
+            "name": name,
+            "symbol": symbol,
+            "amount": amount,
+            "address": address,
+            "create_mint": true,
+            "create_melt": true,
+        }))
+        .send()
+        .await
+        .expect("Failed to create token")
+        .json()
+        .await
+        .expect("Failed to parse create-token response");
+
+    assert!(
+        create_resp
+            .get("success")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        "Token creation failed: {:?}",
+        create_resp
+    );
+
+    // For create-token, the tx hash IS the token UID
+    let token_uid = create_resp
+        .get("hash")
+        .and_then(|v| v.as_str())
+        .expect("No hash in create-token response")
+        .to_string();
+
+    (token_uid.clone(), token_uid)
+}
+
+/// Helper: wait for a token balance to reach a target amount.
+async fn wait_token_balance(
+    c: &Client,
+    session: &Session,
+    wallet_id: &str,
+    token: &str,
+    target: i64,
+    label: &str,
+) -> i64 {
+    for i in 0..30 {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let (avail, _) = get_token_balance(c, session, wallet_id, Some(token)).await;
+        if avail >= target {
+            println!(
+                "  {} confirmed after {}s - {} balance: {}",
+                label,
+                (i + 1) * 2,
+                wallet_id,
+                avail
+            );
+            return avail;
+        }
+    }
+    let (avail, _) = get_token_balance(c, session, wallet_id, Some(token)).await;
+    panic!(
+        "{}: {} token balance is {} but expected >= {}",
+        label, wallet_id, avail, target
+    );
+}
+
+/// Create a custom token and verify the balance.
+#[tokio::test]
+async fn test_create_token() {
+    let c = client();
+    if preflight_faucet(&c, 200).await.is_none() {
+        return;
+    }
+
+    println!("=== TOKEN CREATION TEST ===");
+
+    let session = create_session(&c).await;
+    println!("[setup] Session: {} (api_key: {})", session.id, session.api_key);
+
+    create_wallet(&c, &session, "alice", SEED_ALICE).await;
+    wait_wallet_ready(&c, &session, "alice").await;
+
+    let alice_addr = get_first_address(&c, &session, "alice").await;
+    println!("[setup] Alice address: {}", alice_addr);
+
+    println!("\n[step 1] Funding Alice with {}...", format_htr(200));
+    fund_and_wait(&c, &session, "alice", &alice_addr, 200).await;
+
+    println!("\n[step 2] Creating custom token 'Test Token' (TST), 1000 units...");
+    let (token_uid, token_hash) =
+        create_custom_token(&c, &session, "alice", &alice_addr, "Test Token", "TST", 1000).await;
+    println!("  tx: {}", token_hash);
+    println!("  token_uid: {}", token_uid);
+
+    // Verify token balance
+    let balance = wait_token_balance(&c, &session, "alice", &token_uid, 1000, "creation").await;
+    assert_eq!(balance, 1000, "Alice should have 1000 TST");
+
+    println!("\n=== TOKEN CREATION SUCCESSFUL ===");
+    destroy_session(&c, &session).await;
+}
+
+/// Transfer a custom token between two wallets in separate sessions.
+#[tokio::test]
+async fn test_token_transfer() {
+    let c = client();
+    if preflight_faucet(&c, 500).await.is_none() {
+        return;
+    }
+
+    println!("=== TOKEN TRANSFER TEST ===");
+
+    // Setup two sessions
+    let session_alice = create_session(&c).await;
+    let session_bob = create_session(&c).await;
+    println!(
+        "[setup] Alice session: {} | Bob session: {}",
+        session_alice.id, session_bob.id
+    );
+
+    create_wallet(&c, &session_alice, "alice", SEED_ALICE).await;
+    create_wallet(&c, &session_bob, "bob", SEED_BOB).await;
+    wait_wallet_ready(&c, &session_alice, "alice").await;
+    wait_wallet_ready(&c, &session_bob, "bob").await;
+
+    let alice_addr = get_first_address(&c, &session_alice, "alice").await;
+    let bob_addr = get_first_address(&c, &session_bob, "bob").await;
+    println!("[setup] Alice: {} | Bob: {}", alice_addr, bob_addr);
+
+    // Fund Alice (needs HTR for token creation deposit + transfer fees)
+    println!("\n[step 1] Funding Alice with {}...", format_htr(500));
+    fund_and_wait(&c, &session_alice, "alice", &alice_addr, 500).await;
+
+    // Create token
+    println!("\n[step 2] Creating token 'TransferCoin' (TFC), 500 units...");
+    let (token_uid, token_hash) = create_custom_token(
+        &c,
+        &session_alice,
+        "alice",
+        &alice_addr,
+        "TransferCoin",
+        "TFC",
+        500,
+    )
+    .await;
+    println!("  tx: {}", token_hash);
+    println!("  token_uid: {}", token_uid);
+    wait_token_balance(&c, &session_alice, "alice", &token_uid, 500, "creation").await;
+
+    // Send 200 TFC from Alice to Bob
+    println!("\n[step 3] Alice -> Bob: sending 200 TFC...");
+    let send_resp: Value = c
+        .post(api_url(&session_alice, "/wallet/send-tx"))
+        .header("X-Wallet-Id", "alice")
+        .json(&json!({
+            "outputs": [{
+                "address": bob_addr,
+                "value": 200,
+                "token": token_uid,
+            }],
+        }))
+        .send()
+        .await
+        .expect("Failed to send token")
+        .json()
+        .await
+        .expect("Failed to parse send response");
+
+    assert!(
+        tx_success(&send_resp),
+        "Token send failed: {:?}",
+        send_resp
+    );
+    println!("  tx: {}", tx_hash(&send_resp));
+
+    // Wait for Bob to receive tokens
+    println!("[step 3] Waiting for Bob to receive TFC...");
+    let bob_tfc = wait_token_balance(&c, &session_bob, "bob", &token_uid, 200, "transfer").await;
+    assert_eq!(bob_tfc, 200, "Bob should have 200 TFC");
+
+    // Check Alice's remaining balance
+    let (alice_tfc, _) =
+        get_token_balance(&c, &session_alice, "alice", Some(&token_uid)).await;
+    println!("  Alice TFC balance: {}", alice_tfc);
+    assert_eq!(alice_tfc, 300, "Alice should have 300 TFC remaining");
+
+    // Send 50 TFC back from Bob to Alice
+    println!("\n[step 4] Bob -> Alice: sending 50 TFC...");
+
+    // Bob needs a tiny bit of HTR for the tx fee
+    println!("[step 4] Funding Bob with {} for fee...", format_htr(100));
+    fund_and_wait(&c, &session_bob, "bob", &bob_addr, 100).await;
+
+    let send_back: Value = c
+        .post(api_url(&session_bob, "/wallet/send-tx"))
+        .header("X-Wallet-Id", "bob")
+        .json(&json!({
+            "outputs": [{
+                "address": alice_addr,
+                "value": 50,
+                "token": token_uid,
+            }],
+        }))
+        .send()
+        .await
+        .expect("Failed to send token back")
+        .json()
+        .await
+        .expect("Failed to parse send response");
+
+    assert!(
+        tx_success(&send_back),
+        "Token send back failed: {:?}",
+        send_back
+    );
+    println!("  tx: {}", tx_hash(&send_back));
+
+    // Verify final balances
+    println!("[step 4] Waiting for confirmation...");
+    let alice_final =
+        wait_token_balance(&c, &session_alice, "alice", &token_uid, 350, "return").await;
+    let (bob_final, _) = get_token_balance(&c, &session_bob, "bob", Some(&token_uid)).await;
+
+    println!("\n=== SUMMARY ===");
+    println!(
+        "  Alice TFC: {} (created 500, sent 200, received 50)",
+        alice_final
+    );
+    println!("  Bob TFC:   {} (received 200, sent 50)", bob_final);
+    assert_eq!(alice_final, 350);
+    assert_eq!(bob_final, 150);
+    println!("=== TOKEN TRANSFER SUCCESSFUL ===");
+
+    destroy_session(&c, &session_alice).await;
+    destroy_session(&c, &session_bob).await;
+}
