@@ -913,3 +913,230 @@ async fn test_token_transfer() {
     destroy_session(&c, &session_alice).await;
     destroy_session(&c, &session_bob).await;
 }
+
+/// Mint additional tokens (increase supply) using the mint authority.
+#[tokio::test]
+async fn test_token_mint() {
+    let c = client();
+    if preflight_faucet(&c, 500).await.is_none() {
+        return;
+    }
+
+    println!("=== TOKEN MINT TEST ===");
+
+    let session = create_session(&c).await;
+    println!("[setup] Session: {} (api_key: {})", session.id, session.api_key);
+
+    create_wallet(&c, &session, "alice", SEED_ALICE).await;
+    wait_wallet_ready(&c, &session, "alice").await;
+
+    let alice_addr = get_first_address(&c, &session, "alice").await;
+    println!("[setup] Alice address: {}", alice_addr);
+
+    println!("\n[step 1] Funding Alice with {}...", format_htr(500));
+    fund_and_wait(&c, &session, "alice", &alice_addr, 500).await;
+
+    // Create token with 100 initial supply
+    println!("\n[step 2] Creating token 'MintCoin' (MNT), 100 initial units...");
+    let (token_uid, token_hash) =
+        create_custom_token(&c, &session, "alice", &alice_addr, "MintCoin", "MNT", 100).await;
+    println!("  tx: {}", token_hash);
+    println!("  token_uid: {}", token_uid);
+    wait_token_balance(&c, &session, "alice", &token_uid, 100, "creation").await;
+
+    // Mint 500 more tokens
+    println!("\n[step 3] Minting 500 additional MNT...");
+    let mint_resp: Value = c
+        .post(api_url(&session, "/wallet/mint-tokens"))
+        .header("X-Wallet-Id", "alice")
+        .json(&json!({
+            "token": token_uid,
+            "amount": 500,
+            "address": alice_addr,
+        }))
+        .send()
+        .await
+        .expect("Failed to mint tokens")
+        .json()
+        .await
+        .expect("Failed to parse mint response");
+
+    assert!(
+        tx_success(&mint_resp),
+        "Token mint failed: {:?}",
+        mint_resp
+    );
+    println!("  tx: {}", tx_hash(&mint_resp));
+
+    // Verify new balance: 100 (initial) + 500 (minted) = 600
+    println!("[step 3] Waiting for mint confirmation...");
+    let balance = wait_token_balance(&c, &session, "alice", &token_uid, 600, "mint").await;
+    assert_eq!(balance, 600, "Alice should have 600 MNT after minting");
+
+    // Mint again: 200 more
+    println!("\n[step 4] Minting 200 more MNT...");
+    let mint2_resp: Value = c
+        .post(api_url(&session, "/wallet/mint-tokens"))
+        .header("X-Wallet-Id", "alice")
+        .json(&json!({
+            "token": token_uid,
+            "amount": 200,
+            "address": alice_addr,
+        }))
+        .send()
+        .await
+        .expect("Failed to mint tokens (2nd)")
+        .json()
+        .await
+        .expect("Failed to parse mint response (2nd)");
+
+    assert!(
+        tx_success(&mint2_resp),
+        "Token mint (2nd) failed: {:?}",
+        mint2_resp
+    );
+    println!("  tx: {}", tx_hash(&mint2_resp));
+
+    let final_balance =
+        wait_token_balance(&c, &session, "alice", &token_uid, 800, "mint2").await;
+
+    println!("\n=== SUMMARY ===");
+    println!("  Initial supply: 100 MNT");
+    println!("  After 1st mint (+500): 600 MNT");
+    println!("  After 2nd mint (+200): {} MNT", final_balance);
+    assert_eq!(final_balance, 800);
+    println!("=== TOKEN MINT SUCCESSFUL ===");
+
+    destroy_session(&c, &session).await;
+}
+
+/// Melt tokens (decrease supply) using the melt authority.
+#[tokio::test]
+async fn test_token_melt() {
+    let c = client();
+    if preflight_faucet(&c, 500).await.is_none() {
+        return;
+    }
+
+    println!("=== TOKEN MELT TEST ===");
+
+    let session = create_session(&c).await;
+    println!("[setup] Session: {} (api_key: {})", session.id, session.api_key);
+
+    create_wallet(&c, &session, "alice", SEED_ALICE).await;
+    wait_wallet_ready(&c, &session, "alice").await;
+
+    let alice_addr = get_first_address(&c, &session, "alice").await;
+    println!("[setup] Alice address: {}", alice_addr);
+
+    println!("\n[step 1] Funding Alice with {}...", format_htr(500));
+    fund_and_wait(&c, &session, "alice", &alice_addr, 500).await;
+
+    // Create token with 1000 initial supply
+    println!("\n[step 2] Creating token 'MeltCoin' (MLT), 1000 initial units...");
+    let (token_uid, token_hash) =
+        create_custom_token(&c, &session, "alice", &alice_addr, "MeltCoin", "MLT", 1000).await;
+    println!("  tx: {}", token_hash);
+    println!("  token_uid: {}", token_uid);
+    wait_token_balance(&c, &session, "alice", &token_uid, 1000, "creation").await;
+
+    let htr_before_melt = get_balance(&c, &session, "alice").await.0;
+    println!("  HTR before melt: {}", format_htr(htr_before_melt));
+
+    // Melt 400 tokens
+    println!("\n[step 3] Melting 400 MLT...");
+    let melt_resp: Value = c
+        .post(api_url(&session, "/wallet/melt-tokens"))
+        .header("X-Wallet-Id", "alice")
+        .json(&json!({
+            "token": token_uid,
+            "amount": 400,
+            "deposit_address": alice_addr,
+        }))
+        .send()
+        .await
+        .expect("Failed to melt tokens")
+        .json()
+        .await
+        .expect("Failed to parse melt response");
+
+    assert!(
+        tx_success(&melt_resp),
+        "Token melt failed: {:?}",
+        melt_resp
+    );
+    println!("  tx: {}", tx_hash(&melt_resp));
+
+    // Verify token balance decreased: 1000 - 400 = 600
+    println!("[step 3] Waiting for melt confirmation...");
+    // After melt the balance should be exactly 600
+    for i in 0..30 {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let (avail, _) = get_token_balance(&c, &session, "alice", Some(&token_uid)).await;
+        if avail == 600 {
+            println!(
+                "  confirmed after {}s - MLT balance: {}",
+                (i + 1) * 2,
+                avail
+            );
+            break;
+        }
+    }
+    let (mlt_after, _) = get_token_balance(&c, &session, "alice", Some(&token_uid)).await;
+    assert_eq!(mlt_after, 600, "Alice should have 600 MLT after melting 400");
+
+    // Melting tokens should return some HTR (1% deposit refund)
+    let htr_after_melt = get_balance(&c, &session, "alice").await.0;
+    println!(
+        "  HTR after melt: {} (was {})",
+        format_htr(htr_after_melt),
+        format_htr(htr_before_melt)
+    );
+
+    // Melt 200 more
+    println!("\n[step 4] Melting 200 more MLT...");
+    let melt2_resp: Value = c
+        .post(api_url(&session, "/wallet/melt-tokens"))
+        .header("X-Wallet-Id", "alice")
+        .json(&json!({
+            "token": token_uid,
+            "amount": 200,
+            "deposit_address": alice_addr,
+        }))
+        .send()
+        .await
+        .expect("Failed to melt tokens (2nd)")
+        .json()
+        .await
+        .expect("Failed to parse melt response (2nd)");
+
+    assert!(
+        tx_success(&melt2_resp),
+        "Token melt (2nd) failed: {:?}",
+        melt2_resp
+    );
+    println!("  tx: {}", tx_hash(&melt2_resp));
+
+    for i in 0..30 {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let (avail, _) = get_token_balance(&c, &session, "alice", Some(&token_uid)).await;
+        if avail == 400 {
+            println!(
+                "  confirmed after {}s - MLT balance: {}",
+                (i + 1) * 2,
+                avail
+            );
+            break;
+        }
+    }
+    let (mlt_final, _) = get_token_balance(&c, &session, "alice", Some(&token_uid)).await;
+
+    println!("\n=== SUMMARY ===");
+    println!("  Initial supply: 1000 MLT");
+    println!("  After 1st melt (-400): 600 MLT");
+    println!("  After 2nd melt (-200): {} MLT", mlt_final);
+    assert_eq!(mlt_final, 400);
+    println!("=== TOKEN MELT SUCCESSFUL ===");
+
+    destroy_session(&c, &session).await;
+}
