@@ -344,3 +344,100 @@ async fn test_session_isolation() {
     destroy_session(&c, &session1).await;
     destroy_session(&c, &session2).await;
 }
+
+/// Verify that each container is protected by its own API key:
+/// - Direct access without key is rejected
+/// - Direct access with wrong key is rejected
+/// - Proxy access (which injects the correct key) works
+#[tokio::test]
+async fn test_api_key_enforcement() {
+    let c = client();
+    let session = create_session(&c).await;
+    println!("Session: {} (api_key: {})", session.id, session.api_key);
+
+    // Get the container's direct port from the list endpoint
+    let resp: Value = c
+        .get(format!("{}/sessions", orchestrator_url()))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let sessions = resp["sessions"].as_array().unwrap();
+    let our_session = sessions
+        .iter()
+        .find(|s| s["session_id"].as_str() == Some(&session.id))
+        .expect("Session not found in list");
+    let port = our_session["port"].as_u64().expect("No port in session");
+    let direct_url = format!("http://127.0.0.1:{}", port);
+    println!("Direct container URL: {}", direct_url);
+
+    // 1. No API key — should be rejected (401)
+    let resp_no_key = c
+        .get(format!("{}/wallet/status", direct_url))
+        .header("X-Wallet-Id", "probe")
+        .send()
+        .await
+        .expect("Request failed");
+    let status_no_key = resp_no_key.status().as_u16();
+    println!("No API key: HTTP {}", status_no_key);
+    assert!(
+        status_no_key == 401 || status_no_key == 403,
+        "Direct access without API key should be rejected, got {}",
+        status_no_key
+    );
+
+    // 2. Wrong API key — should be rejected (401)
+    let resp_wrong_key = c
+        .get(format!("{}/wallet/status", direct_url))
+        .header("X-Wallet-Id", "probe")
+        .header("x-api-key", "wrong-key-12345")
+        .send()
+        .await
+        .expect("Request failed");
+    let status_wrong_key = resp_wrong_key.status().as_u16();
+    println!("Wrong API key: HTTP {}", status_wrong_key);
+    assert!(
+        status_wrong_key == 401 || status_wrong_key == 403,
+        "Direct access with wrong API key should be rejected, got {}",
+        status_wrong_key
+    );
+
+    // 3. Correct API key — should work
+    let resp_correct_key = c
+        .get(format!("{}/wallet/status", direct_url))
+        .header("X-Wallet-Id", "probe")
+        .header("x-api-key", &session.api_key)
+        .send()
+        .await
+        .expect("Request failed");
+    let status_correct = resp_correct_key.status().as_u16();
+    println!("Correct API key: HTTP {}", status_correct);
+    assert!(
+        status_correct != 401 && status_correct != 403,
+        "Direct access with correct API key should not be rejected, got {}",
+        status_correct
+    );
+
+    // 4. Through proxy (no key in request, proxy injects it) — should work
+    let resp_proxy = c
+        .get(api_url(&session, "/wallet/status"))
+        .header("X-Wallet-Id", "probe")
+        .send()
+        .await
+        .expect("Request failed");
+    let status_proxy = resp_proxy.status().as_u16();
+    println!("Through proxy: HTTP {}", status_proxy);
+    assert!(
+        status_proxy != 401 && status_proxy != 403,
+        "Proxy should inject the correct API key, got {}",
+        status_proxy
+    );
+
+    println!("API key enforcement verified");
+
+    // Cleanup
+    destroy_session(&c, &session).await;
+}
