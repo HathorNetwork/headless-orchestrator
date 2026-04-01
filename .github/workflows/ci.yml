@@ -1,0 +1,126 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  integration:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout orchestrator
+        uses: actions/checkout@v5
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y patchelf libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: Build headless-orchestrator
+        run: cargo build --release
+
+      - name: Download hathor-forge release
+        run: |
+          gh release download --repo HathorNetwork/hathor-forge --pattern "*.deb" --dir /tmp
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Extract hathor-forge from .deb
+        run: |
+          mkdir -p /tmp/forge
+          cd /tmp/forge
+          ar x /tmp/*.deb
+          tar xf data.tar.gz
+          echo "Extracted contents:"
+          ls -la usr/bin/
+          ls -la "usr/lib/Hathor Forge/"
+          # Ensure binaries are executable
+          chmod +x usr/bin/*
+          chmod +x "usr/lib/Hathor Forge/binaries/"*/*  2>/dev/null || true
+          # Fix Nix-built binaries: patch ELF interpreter and RPATH to use system libs
+          for bin in usr/bin/hathor-forge-cli usr/bin/cpuminer; do
+            if [ -f "$bin" ]; then
+              patchelf --set-interpreter /lib64/ld-linux-x86-64.so.2 --remove-rpath "$bin" 2>/dev/null || true
+            fi
+          done
+          # Also patch hathor-core and tx-mining-service PyInstaller binaries
+          find "usr/lib/Hathor Forge/binaries" -maxdepth 2 -type f -executable \
+            -exec sh -c 'file "$1" | grep -q "ELF.*dynamically linked" && patchelf --set-interpreter /lib64/ld-linux-x86-64.so.2 --remove-rpath "$1" 2>/dev/null || true' _ {} \;
+          # Set env vars for binary resolution
+          echo "HATHOR_FORGE_BINARIES_DIR=/tmp/forge/usr/lib/Hathor Forge/binaries" >> "$GITHUB_ENV"
+
+      - name: Start hathor-forge-cli privatenet
+        run: |
+          /tmp/forge/usr/bin/hathor-forge-cli --start --no-wallet --no-tui &
+          echo $! > /tmp/forge-cli.pid
+
+          echo "Waiting for fullnode..."
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:49080/v1a/status/ > /dev/null 2>&1; then
+              echo "Fullnode ready!"
+              break
+            fi
+            sleep 2
+          done
+          curl -sf http://localhost:49080/v1a/status/ || (echo "Fullnode failed to start" && exit 1)
+
+      - name: Wait for mining rewards
+        run: |
+          echo "Waiting for faucet to accumulate funds..."
+          for i in $(seq 1 60); do
+            BALANCE=$(curl -sf http://localhost:49080/v1a/wallet/balance/ 2>/dev/null || echo '{}')
+            AVAILABLE=$(echo "$BALANCE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('balance',{}).get('available',0))" 2>/dev/null || echo 0)
+            if [ "$AVAILABLE" -gt 1000 ]; then
+              echo "Faucet funded with $AVAILABLE cents"
+              break
+            fi
+            echo "  Mining... faucet: $AVAILABLE cents"
+            sleep 3
+          done
+
+      - name: Pull wallet-headless Docker image
+        run: docker pull hathornetwork/hathor-wallet-headless:latest
+
+      - name: Start headless-orchestrator
+        run: |
+          ./target/release/headless-orchestrator \
+            --fullnode-url http://172.17.0.1:49080/v1a/ \
+            --tx-mining-url http://172.17.0.1:49002 \
+            --network privatenet \
+            --idle-timeout-secs 600 &
+          echo $! > /tmp/orchestrator.pid
+          sleep 2
+          curl -sf http://localhost:8100/health || (echo "Orchestrator failed to start" && exit 1)
+
+      - name: Run integration tests
+        env:
+          ORCHESTRATOR_URL: http://localhost:8100
+          FULLNODE_URL: http://localhost:49080
+          RUST_LOG: info
+        run: cargo test --test integration -- --test-threads=1 --nocapture
+
+      - name: Cleanup
+        if: always()
+        run: |
+          [ -f /tmp/orchestrator.pid ] && kill "$(cat /tmp/orchestrator.pid)" 2>/dev/null || true
+          [ -f /tmp/forge-cli.pid ] && kill "$(cat /tmp/forge-cli.pid)" 2>/dev/null || true
+          docker rm -f $(docker ps -q --filter "label=managed-by=headless-orchestrator") 2>/dev/null || true
