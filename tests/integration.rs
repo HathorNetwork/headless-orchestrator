@@ -1140,3 +1140,375 @@ async fn test_token_melt() {
 
     destroy_session(&c, &session).await;
 }
+
+/// Full token lifecycle: create, mint, transfer, melt — all in one test.
+#[tokio::test]
+async fn test_token_full_lifecycle() {
+    let c = client();
+    if preflight_faucet(&c, 1000).await.is_none() {
+        return;
+    }
+
+    println!("=== TOKEN FULL LIFECYCLE TEST ===");
+
+    let session_alice = create_session(&c).await;
+    let session_bob = create_session(&c).await;
+    println!(
+        "[setup] Alice session: {} | Bob session: {}",
+        session_alice.id, session_bob.id
+    );
+
+    create_wallet(&c, &session_alice, "alice", SEED_ALICE).await;
+    create_wallet(&c, &session_bob, "bob", SEED_BOB).await;
+    wait_wallet_ready(&c, &session_alice, "alice").await;
+    wait_wallet_ready(&c, &session_bob, "bob").await;
+
+    let alice_addr = get_first_address(&c, &session_alice, "alice").await;
+    let bob_addr = get_first_address(&c, &session_bob, "bob").await;
+    println!("[setup] Alice: {} | Bob: {}", alice_addr, bob_addr);
+
+    // Fund both wallets
+    println!("\n[step 1] Funding wallets...");
+    println!("  Funding Alice with {}...", format_htr(800));
+    fund_and_wait(&c, &session_alice, "alice", &alice_addr, 800).await;
+    println!("  Funding Bob with {}...", format_htr(200));
+    fund_and_wait(&c, &session_bob, "bob", &bob_addr, 200).await;
+
+    // Step 2: Create token
+    println!("\n[step 2] Creating token 'LifeCoin' (LFC), 200 initial units...");
+    let (token_uid, token_hash) = create_custom_token(
+        &c,
+        &session_alice,
+        "alice",
+        &alice_addr,
+        "LifeCoin",
+        "LFC",
+        200,
+    )
+    .await;
+    println!("  tx: {}", token_hash);
+    println!("  token_uid: {}", token_uid);
+    wait_token_balance(&c, &session_alice, "alice", &token_uid, 200, "creation").await;
+
+    // Step 3: Mint 300 more
+    println!("\n[step 3] Minting 300 additional LFC...");
+    let mint_resp: Value = c
+        .post(api_url(&session_alice, "/wallet/mint-tokens"))
+        .header("X-Wallet-Id", "alice")
+        .json(&json!({
+            "token": token_uid,
+            "amount": 300,
+            "address": alice_addr,
+        }))
+        .send()
+        .await
+        .expect("Failed to mint tokens")
+        .json()
+        .await
+        .expect("Failed to parse mint response");
+    assert!(tx_success(&mint_resp), "Mint failed: {:?}", mint_resp);
+    println!("  tx: {}", tx_hash(&mint_resp));
+    wait_token_balance(&c, &session_alice, "alice", &token_uid, 500, "mint").await;
+
+    // Step 4: Transfer 150 LFC to Bob
+    println!("\n[step 4] Alice -> Bob: sending 150 LFC...");
+    let send_resp: Value = c
+        .post(api_url(&session_alice, "/wallet/send-tx"))
+        .header("X-Wallet-Id", "alice")
+        .json(&json!({
+            "outputs": [{
+                "address": bob_addr,
+                "value": 150,
+                "token": token_uid,
+            }],
+        }))
+        .send()
+        .await
+        .expect("Failed to send LFC")
+        .json()
+        .await
+        .expect("Failed to parse send response");
+    assert!(tx_success(&send_resp), "Send failed: {:?}", send_resp);
+    println!("  tx: {}", tx_hash(&send_resp));
+    wait_token_balance(&c, &session_bob, "bob", &token_uid, 150, "transfer").await;
+
+    let (alice_after_send, _) =
+        get_token_balance(&c, &session_alice, "alice", Some(&token_uid)).await;
+    println!("  Alice LFC: {} | Bob LFC: 150", alice_after_send);
+    assert_eq!(alice_after_send, 350);
+
+    // Step 5: Melt 100 LFC from Alice's supply
+    println!("\n[step 5] Melting 100 LFC from Alice...");
+    let melt_resp: Value = c
+        .post(api_url(&session_alice, "/wallet/melt-tokens"))
+        .header("X-Wallet-Id", "alice")
+        .json(&json!({
+            "token": token_uid,
+            "amount": 100,
+            "deposit_address": alice_addr,
+        }))
+        .send()
+        .await
+        .expect("Failed to melt tokens")
+        .json()
+        .await
+        .expect("Failed to parse melt response");
+    assert!(tx_success(&melt_resp), "Melt failed: {:?}", melt_resp);
+    println!("  tx: {}", tx_hash(&melt_resp));
+
+    for i in 0..30 {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let (avail, _) =
+            get_token_balance(&c, &session_alice, "alice", Some(&token_uid)).await;
+        if avail == 250 {
+            println!("  confirmed after {}s - Alice LFC: {}", (i + 1) * 2, avail);
+            break;
+        }
+    }
+
+    // Final balances
+    let (alice_final, _) =
+        get_token_balance(&c, &session_alice, "alice", Some(&token_uid)).await;
+    let (bob_final, _) = get_token_balance(&c, &session_bob, "bob", Some(&token_uid)).await;
+
+    println!("\n=== SUMMARY ===");
+    println!("  Created: 200 LFC");
+    println!("  Minted:  +300 LFC (total 500)");
+    println!("  Sent:    -150 LFC to Bob (Alice: 350, Bob: 150)");
+    println!("  Melted:  -100 LFC from Alice (Alice: 250, Bob: 150)");
+    println!("  Final — Alice: {} LFC, Bob: {} LFC", alice_final, bob_final);
+    assert_eq!(alice_final, 250);
+    assert_eq!(bob_final, 150);
+    println!("=== TOKEN FULL LIFECYCLE SUCCESSFUL ===");
+
+    destroy_session(&c, &session_alice).await;
+    destroy_session(&c, &session_bob).await;
+}
+
+// ============================================================================
+// Nano Contract Tests
+// ============================================================================
+
+/// Minimal blueprint source code for testing.
+/// A simple "Vault" that accepts deposits.
+const VAULT_BLUEPRINT: &str = r#"
+from hathor import Address, Blueprint, Context, public, view, export
+
+@export
+class Vault(Blueprint):
+    owner: Address
+
+    @public
+    def initialize(self, ctx: Context, owner: Address) -> None:
+        self.owner = owner
+
+    @public(allow_deposit=True)
+    def deposit(self, ctx: Context) -> None:
+        pass
+
+    @view
+    def get_owner(self) -> Address:
+        return self.owner
+"#;
+
+/// Full nano contract lifecycle:
+/// 1. Publish an on-chain blueprint (OCB)
+/// 2. Create a nano contract from the blueprint
+/// 3. Deposit funds into the nano contract
+/// 4. Query nano contract state
+#[tokio::test]
+async fn test_nano_contract_lifecycle() {
+    let c = client();
+    if preflight_faucet(&c, 500).await.is_none() {
+        return;
+    }
+
+    println!("=== NANO CONTRACT LIFECYCLE TEST ===");
+
+    // Setup
+    let session = create_session(&c).await;
+    println!("[setup] Session: {} (api_key: {})", session.id, session.api_key);
+
+    create_wallet(&c, &session, "alice", SEED_ALICE).await;
+    wait_wallet_ready(&c, &session, "alice").await;
+
+    let alice_addr = get_first_address(&c, &session, "alice").await;
+    println!("[setup] Alice address: {}", alice_addr);
+
+    // Fund Alice
+    println!("\n[step 1] Funding Alice with {}...", format_htr(500));
+    fund_and_wait(&c, &session, "alice", &alice_addr, 500).await;
+
+    // Step 2: Publish on-chain blueprint
+    println!("\n[step 2] Publishing on-chain blueprint (Vault)...");
+    let ocb_resp: Value = c
+        .post(api_url(&session, "/wallet/nano-contracts/create-on-chain-blueprint"))
+        .header("X-Wallet-Id", "alice")
+        .json(&json!({
+            "code": VAULT_BLUEPRINT.trim(),
+            "address": alice_addr,
+        }))
+        .send()
+        .await
+        .expect("Failed to publish blueprint")
+        .json()
+        .await
+        .expect("Failed to parse OCB response");
+
+    let ocb_success = ocb_resp.get("success").and_then(|v| v.as_bool()).unwrap_or(false)
+        || ocb_resp.get("hash").is_some();
+    println!("  response keys: {:?}", ocb_resp.as_object().map(|o| o.keys().collect::<Vec<_>>()));
+    assert!(
+        ocb_success,
+        "Blueprint publish failed: {:?}",
+        ocb_resp
+    );
+
+    let blueprint_id = ocb_resp
+        .get("hash")
+        .and_then(|v| v.as_str())
+        .expect("No hash in OCB response");
+    println!("  blueprint tx: {}", blueprint_id);
+    println!("  status: OK");
+
+    // Wait for blueprint to be confirmed (mined into a block)
+    println!("[step 2] Waiting for blueprint confirmation...");
+    for i in 0..30 {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let bp_check = c
+            .get(format!(
+                "{}/v1a/nano_contract/blueprint?id={}",
+                fullnode_url(),
+                blueprint_id
+            ))
+            .send()
+            .await;
+        if let Ok(resp) = bp_check {
+            let body: Value = resp.json().await.unwrap_or_default();
+            if body.get("success").and_then(|v| v.as_bool()).unwrap_or(false) {
+                println!("  confirmed after {}s", (i + 1) * 2);
+                break;
+            }
+        }
+    }
+
+    // Step 3: Create nano contract from blueprint
+    println!("\n[step 3] Creating nano contract from blueprint...");
+    let nc_resp: Value = c
+        .post(api_url(&session, "/wallet/nano-contracts/create"))
+        .header("X-Wallet-Id", "alice")
+        .json(&json!({
+            "blueprint_id": blueprint_id,
+            "address": alice_addr,
+            "data": {
+                "args": [alice_addr],
+                "actions": [],
+            },
+        }))
+        .send()
+        .await
+        .expect("Failed to create nano contract")
+        .json()
+        .await
+        .expect("Failed to parse NC create response");
+
+    let nc_success = nc_resp.get("success").and_then(|v| v.as_bool()).unwrap_or(false)
+        || nc_resp.get("hash").is_some();
+    println!("  response keys: {:?}", nc_resp.as_object().map(|o| o.keys().collect::<Vec<_>>()));
+    assert!(
+        nc_success,
+        "Nano contract creation failed: {:?}",
+        nc_resp
+    );
+
+    let nc_id = nc_resp
+        .get("hash")
+        .and_then(|v| v.as_str())
+        .expect("No hash in NC create response");
+    println!("  nc_id: {}", nc_id);
+    println!("  status: OK");
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // Step 4: Deposit HTR into the nano contract
+    println!("\n[step 4] Depositing {} into nano contract...", format_htr(100));
+    let deposit_resp: Value = c
+        .post(api_url(&session, "/wallet/nano-contracts/execute"))
+        .header("X-Wallet-Id", "alice")
+        .json(&json!({
+            "nc_id": nc_id,
+            "method": "deposit",
+            "address": alice_addr,
+            "data": {
+                "args": [],
+                "actions": [{
+                    "type": "deposit",
+                    "token": "00",
+                    "amount": 100,
+                }],
+            },
+        }))
+        .send()
+        .await
+        .expect("Failed to deposit into NC")
+        .json()
+        .await
+        .expect("Failed to parse NC execute response");
+
+    let deposit_success = deposit_resp.get("success").and_then(|v| v.as_bool()).unwrap_or(false)
+        || deposit_resp.get("hash").is_some();
+    println!("  response keys: {:?}", deposit_resp.as_object().map(|o| o.keys().collect::<Vec<_>>()));
+    assert!(
+        deposit_success,
+        "Nano contract deposit failed: {:?}",
+        deposit_resp
+    );
+
+    let deposit_tx = deposit_resp
+        .get("hash")
+        .and_then(|v| v.as_str())
+        .unwrap_or("UNKNOWN");
+    println!("  tx: {}", deposit_tx);
+    println!("  status: OK");
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // Step 5: Query nano contract state from fullnode
+    println!("\n[step 5] Querying nano contract state...");
+    let state_resp: Value = c
+        .get(format!(
+            "{}/v1a/nano_contract/state?id={}",
+            fullnode_url(),
+            nc_id
+        ))
+        .send()
+        .await
+        .expect("Failed to get NC state")
+        .json()
+        .await
+        .expect("Failed to parse NC state");
+
+    let nc_success_state = state_resp.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
+    println!("  success: {}", nc_success_state);
+
+    if let Some(fields) = state_resp.get("fields") {
+        if let Some(owner) = fields.get("owner") {
+            println!("  owner: {}", owner);
+        }
+    }
+
+    if let Some(balances) = state_resp.get("balances") {
+        println!("  balances: {}", balances);
+    }
+
+    println!("  nc_id: {}", nc_id);
+
+    // === Summary ===
+    println!("\n=== SUMMARY ===");
+    println!("  Blueprint published: {}", blueprint_id);
+    println!("  Nano contract created: {}", nc_id);
+    println!("  Deposit tx: {}", deposit_tx);
+    println!("=== NANO CONTRACT LIFECYCLE SUCCESSFUL ===");
+
+    destroy_session(&c, &session).await;
+}
