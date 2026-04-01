@@ -441,3 +441,223 @@ async fn test_api_key_enforcement() {
     // Cleanup
     destroy_session(&c, &session).await;
 }
+
+fn tx_hash(resp: &Value) -> &str {
+    // Faucet response: { "tx": { "hash": "..." } }
+    // Headless response: { "hash": "..." }
+    resp.get("tx")
+        .and_then(|tx| tx.get("hash"))
+        .or_else(|| resp.get("hash"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("UNKNOWN")
+}
+
+fn tx_success(resp: &Value) -> bool {
+    resp.get("success").and_then(|v| v.as_bool()).unwrap_or(false)
+}
+
+fn format_htr(cents: i64) -> String {
+    format!("{}.{:02} HTR", cents / 100, cents % 100)
+}
+
+/// Helper: pre-flight check for faucet availability.
+/// Returns the available balance or None if skipped.
+async fn preflight_faucet(c: &Client, min_funds: i64) -> Option<i64> {
+    let faucet_check = c
+        .get(format!("{}/v1a/wallet/balance/", fullnode_url()))
+        .send()
+        .await;
+    if faucet_check.is_err() {
+        println!("SKIP: No local fullnode running at {}", fullnode_url());
+        return None;
+    }
+    let faucet_balance: Value = faucet_check.unwrap().json().await.unwrap();
+    let faucet_available = faucet_balance["balance"]
+        .get("available")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    if faucet_available < min_funds {
+        println!(
+            "SKIP: Faucet insufficient funds ({} < {})",
+            format_htr(faucet_available),
+            format_htr(min_funds)
+        );
+        return None;
+    }
+    Some(faucet_available)
+}
+
+/// Helper: fund a wallet and wait for confirmation.
+async fn fund_and_wait(
+    c: &Client,
+    session: &Session,
+    wallet_id: &str,
+    address: &str,
+    amount: i64,
+) {
+    let fund = send_from_faucet(c, address, amount).await;
+    assert!(tx_success(&fund), "Faucet send failed: {:?}", fund);
+    println!("  tx: {}", tx_hash(&fund));
+
+    for i in 0..30 {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let (avail, _) = get_balance(c, session, wallet_id).await;
+        if avail >= amount {
+            println!(
+                "  confirmed after {}s - balance: {}",
+                (i + 1) * 2,
+                format_htr(avail)
+            );
+            return;
+        }
+    }
+    panic!(
+        "Wallet {} did not receive {} within 60s",
+        wallet_id,
+        format_htr(amount)
+    );
+}
+
+/// Full e2e test: fund wallets from faucet, send between them.
+/// Requires hathor-forge-cli running with --start (privatenet with funded faucet).
+#[tokio::test]
+async fn test_fund_and_transfer() {
+    let c = client();
+    let faucet_available = match preflight_faucet(&c, 1000).await {
+        Some(v) => v,
+        None => return,
+    };
+
+    println!("=== E2E TRANSFER TEST ===");
+    println!("Faucet balance: {}", format_htr(faucet_available));
+
+    // --- Setup: create isolated sessions + wallets ---
+    println!("\n[setup] Creating isolated sessions...");
+    let session_alice = create_session(&c).await;
+    let session_bob = create_session(&c).await;
+    println!("  Alice session: {} (api_key: {})", session_alice.id, session_alice.api_key);
+    println!("  Bob session:   {} (api_key: {})", session_bob.id, session_bob.api_key);
+
+    println!("[setup] Creating wallets...");
+    create_wallet(&c, &session_alice, "alice", SEED_ALICE).await;
+    create_wallet(&c, &session_bob, "bob", SEED_BOB).await;
+
+    println!("[setup] Waiting for wallet sync...");
+    wait_wallet_ready(&c, &session_alice, "alice").await;
+    wait_wallet_ready(&c, &session_bob, "bob").await;
+
+    let alice_addr = get_first_address(&c, &session_alice, "alice").await;
+    let bob_addr = get_first_address(&c, &session_bob, "bob").await;
+    println!("  Alice address: {}", alice_addr);
+    println!("  Bob address:   {}", bob_addr);
+
+    // === Step 1: Fund Alice from faucet (5 HTR) ===
+    println!("\n[step 1] Faucet -> Alice: sending {}...", format_htr(500));
+    let fund_result = send_from_faucet(&c, &alice_addr, 500).await;
+    assert!(
+        tx_success(&fund_result),
+        "Faucet send failed: {:?}",
+        fund_result
+    );
+    println!("  tx: {}", tx_hash(&fund_result));
+    println!("  status: OK");
+
+    println!("[step 1] Waiting for confirmation...");
+    let mut alice_balance = (0i64, 0i64);
+    for i in 0..30 {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        alice_balance = get_balance(&c, &session_alice, "alice").await;
+        if alice_balance.0 > 0 {
+            println!(
+                "  confirmed after {}s - Alice balance: {}",
+                (i + 1) * 2,
+                format_htr(alice_balance.0)
+            );
+            break;
+        }
+    }
+    assert!(
+        alice_balance.0 > 0,
+        "Alice should have received funds from faucet"
+    );
+
+    // === Step 2: Alice sends 2 HTR to Bob ===
+    println!("\n[step 2] Alice -> Bob: sending {}...", format_htr(200));
+    let send_result = send_tx(&c, &session_alice, "alice", &bob_addr, 200).await;
+    assert!(
+        tx_success(&send_result),
+        "Alice->Bob send failed: {:?}",
+        send_result
+    );
+    println!("  tx: {}", tx_hash(&send_result));
+    println!("  status: OK");
+
+    println!("[step 2] Waiting for confirmation...");
+    let mut bob_balance = (0i64, 0i64);
+    for i in 0..30 {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        bob_balance = get_balance(&c, &session_bob, "bob").await;
+        if bob_balance.0 > 0 {
+            println!(
+                "  confirmed after {}s - Bob balance: {}",
+                (i + 1) * 2,
+                format_htr(bob_balance.0)
+            );
+            break;
+        }
+    }
+    assert!(bob_balance.0 > 0, "Bob should have received funds from Alice");
+
+    let alice_after_send = get_balance(&c, &session_alice, "alice").await;
+    println!(
+        "  Alice balance after send: {}",
+        format_htr(alice_after_send.0)
+    );
+    assert!(
+        alice_after_send.0 < alice_balance.0,
+        "Alice should have less after sending to Bob"
+    );
+
+    // === Step 3: Bob sends 1 HTR back to Alice ===
+    println!("\n[step 3] Bob -> Alice: sending {}...", format_htr(100));
+    let send_back = send_tx(&c, &session_bob, "bob", &alice_addr, 100).await;
+    assert!(
+        tx_success(&send_back),
+        "Bob->Alice send failed: {:?}",
+        send_back
+    );
+    println!("  tx: {}", tx_hash(&send_back));
+    println!("  status: OK");
+
+    println!("[step 3] Waiting for confirmation...");
+    let alice_before_return = alice_after_send.0;
+    let mut alice_final = (0i64, 0i64);
+    for i in 0..30 {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        alice_final = get_balance(&c, &session_alice, "alice").await;
+        if alice_final.0 > alice_before_return {
+            println!(
+                "  confirmed after {}s - Alice balance: {}",
+                (i + 1) * 2,
+                format_htr(alice_final.0)
+            );
+            break;
+        }
+    }
+    assert!(
+        alice_final.0 > alice_before_return,
+        "Alice should have more after Bob sent funds back"
+    );
+
+    let bob_final = get_balance(&c, &session_bob, "bob").await;
+
+    // === Summary ===
+    println!("\n=== SUMMARY ===");
+    println!("  Alice: {} (started at 0, funded 5.00, sent 2.00, received 1.00)", format_htr(alice_final.0));
+    println!("  Bob:   {} (started at 0, received 2.00, sent 1.00)", format_htr(bob_final.0));
+    println!("=== ALL TRANSFERS SUCCESSFUL ===");
+
+    // Cleanup
+    destroy_session(&c, &session_alice).await;
+    destroy_session(&c, &session_bob).await;
+}
