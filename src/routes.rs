@@ -1,6 +1,6 @@
 use axum::{
     body::Body,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, Method, StatusCode},
     response::{IntoResponse, Json, Response},
     routing::{any, delete, get, post},
@@ -110,11 +110,20 @@ async fn destroy_session(
 async fn proxy_handler(
     State(state): State<SharedState>,
     Path((session_id, rest)): Path<(String, String)>,
+    Query(query_params): Query<std::collections::HashMap<String, String>>,
     method: Method,
     headers: HeaderMap,
     body: String,
 ) -> Response<Body> {
-    let path = format!("/{}", rest);
+    let path = if query_params.is_empty() {
+        format!("/{}", rest)
+    } else {
+        let qs: Vec<String> = query_params
+            .iter()
+            .map(|(k, v)| format!("{}={}", k, v))
+            .collect();
+        format!("/{}?{}", rest, qs.join("&"))
+    };
 
     // Forward relevant headers
     let fwd_headers: Vec<(String, String)> = headers
