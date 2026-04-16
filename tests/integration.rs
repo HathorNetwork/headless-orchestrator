@@ -63,6 +63,7 @@ async fn create_session(c: &Client) -> Session {
 
 async fn destroy_session(c: &Client, session: &Session) {
     c.delete(format!("{}/sessions/{}", orchestrator_url(), session.id))
+        .header("x-api-key", &session.api_key)
         .send()
         .await
         .expect("Failed to destroy session");
@@ -80,6 +81,7 @@ fn api_url(session: &Session, path: &str) -> String {
 async fn create_wallet(c: &Client, session: &Session, wallet_id: &str, seed: &str) {
     let resp: Value = c
         .post(api_url(session, "/start"))
+        .header("x-api-key", &session.api_key)
         .json(&json!({
             "wallet-id": wallet_id,
             "seed": seed,
@@ -104,6 +106,7 @@ async fn wait_wallet_ready(c: &Client, session: &Session, wallet_id: &str) {
 
         let resp: Value = c
             .get(api_url(session, "/wallet/status"))
+            .header("x-api-key", &session.api_key)
             .header("X-Wallet-Id", wallet_id)
             .send()
             .await
@@ -122,6 +125,7 @@ async fn wait_wallet_ready(c: &Client, session: &Session, wallet_id: &str) {
 async fn get_first_address(c: &Client, session: &Session, wallet_id: &str) -> String {
     let resp: Value = c
         .get(api_url(session, "/wallet/addresses"))
+        .header("x-api-key", &session.api_key)
         .header("X-Wallet-Id", wallet_id)
         .send()
         .await
@@ -157,6 +161,7 @@ async fn get_token_balance(
 
     let resp: Value = c
         .get(&url)
+        .header("x-api-key", &session.api_key)
         .header("X-Wallet-Id", wallet_id)
         .send()
         .await
@@ -197,6 +202,7 @@ async fn send_tx(
     value: i64,
 ) -> Value {
     c.post(api_url(session, "/wallet/simple-send-tx"))
+        .header("x-api-key", &session.api_key)
         .header("X-Wallet-Id", wallet_id)
         .json(&json!({
             "address": address,
@@ -345,10 +351,19 @@ async fn test_session_isolation() {
     destroy_session(&c, &session2).await;
 }
 
-/// Verify that each container is protected by its own API key:
+/// Verify that both the container and the orchestrator proxy enforce
+/// per-session API keys.
+///
+/// Container-level (wallet-headless itself):
 /// - Direct access without key is rejected
 /// - Direct access with wrong key is rejected
-/// - Proxy access (which injects the correct key) works
+/// - Direct access with correct key works
+///
+/// Proxy-level (the orchestrator, which used to auto-inject the key):
+/// - Proxy call without key → 401
+/// - Proxy call with wrong key → 401
+/// - Proxy call with another session's key → 401
+/// - Proxy call with the right key → OK
 #[tokio::test]
 async fn test_api_key_enforcement() {
     let c = client();
@@ -374,6 +389,8 @@ async fn test_api_key_enforcement() {
     let direct_url = format!("http://127.0.0.1:{}", port);
     println!("Direct container URL: {}", direct_url);
 
+    // ---- Container-level (wallet-headless enforces its own x-api-key) ----
+
     // 1. No API key — should be rejected (401)
     let resp_no_key = c
         .get(format!("{}/wallet/status", direct_url))
@@ -382,7 +399,7 @@ async fn test_api_key_enforcement() {
         .await
         .expect("Request failed");
     let status_no_key = resp_no_key.status().as_u16();
-    println!("No API key: HTTP {}", status_no_key);
+    println!("[container] No API key: HTTP {}", status_no_key);
     assert!(
         status_no_key == 401 || status_no_key == 403,
         "Direct access without API key should be rejected, got {}",
@@ -398,7 +415,7 @@ async fn test_api_key_enforcement() {
         .await
         .expect("Request failed");
     let status_wrong_key = resp_wrong_key.status().as_u16();
-    println!("Wrong API key: HTTP {}", status_wrong_key);
+    println!("[container] Wrong API key: HTTP {}", status_wrong_key);
     assert!(
         status_wrong_key == 401 || status_wrong_key == 403,
         "Direct access with wrong API key should be rejected, got {}",
@@ -414,31 +431,109 @@ async fn test_api_key_enforcement() {
         .await
         .expect("Request failed");
     let status_correct = resp_correct_key.status().as_u16();
-    println!("Correct API key: HTTP {}", status_correct);
+    println!("[container] Correct API key: HTTP {}", status_correct);
     assert!(
         status_correct != 401 && status_correct != 403,
         "Direct access with correct API key should not be rejected, got {}",
         status_correct
     );
 
-    // 4. Through proxy (no key in request, proxy injects it) — should work
-    let resp_proxy = c
+    // ---- Proxy-level (orchestrator enforces the caller-provided key) ----
+
+    // 4. Proxy call WITHOUT x-api-key → 401. The orchestrator used to auto-
+    //    inject the session's key; this is the regression guard for the
+    //    per-wallet-auth feature.
+    let resp_proxy_no_key = c
         .get(api_url(&session, "/wallet/status"))
         .header("X-Wallet-Id", "probe")
         .send()
         .await
-        .expect("Request failed");
-    let status_proxy = resp_proxy.status().as_u16();
-    println!("Through proxy: HTTP {}", status_proxy);
-    assert!(
-        status_proxy != 401 && status_proxy != 403,
-        "Proxy should inject the correct API key, got {}",
-        status_proxy
+        .expect("Proxy request (no key) failed");
+    let status_proxy_no_key = resp_proxy_no_key.status().as_u16();
+    println!("[proxy] No x-api-key: HTTP {}", status_proxy_no_key);
+    assert_eq!(
+        status_proxy_no_key, 401,
+        "Proxy must reject requests without x-api-key"
     );
 
-    println!("API key enforcement verified");
+    // 5. Proxy call with WRONG x-api-key → 401.
+    let resp_proxy_wrong_key = c
+        .get(api_url(&session, "/wallet/status"))
+        .header("x-api-key", "not-the-right-key")
+        .header("X-Wallet-Id", "probe")
+        .send()
+        .await
+        .expect("Proxy request (wrong key) failed");
+    let status_proxy_wrong_key = resp_proxy_wrong_key.status().as_u16();
+    println!("[proxy] Wrong x-api-key: HTTP {}", status_proxy_wrong_key);
+    assert_eq!(
+        status_proxy_wrong_key, 401,
+        "Proxy must reject requests with a non-matching x-api-key"
+    );
 
-    // Cleanup
+    // 6. Cross-session: a second session's key must NOT open the first's.
+    let other_session = create_session(&c).await;
+    let resp_cross = c
+        .get(api_url(&session, "/wallet/status"))
+        .header("x-api-key", &other_session.api_key)
+        .header("X-Wallet-Id", "probe")
+        .send()
+        .await
+        .expect("Proxy request (cross-session key) failed");
+    let status_cross = resp_cross.status().as_u16();
+    println!("[proxy] Other session's key: HTTP {}", status_cross);
+    assert_eq!(
+        status_cross, 401,
+        "Proxy must reject another session's api_key"
+    );
+
+    // 7. Proxy call WITH the right key → not 401.
+    let resp_proxy_ok = c
+        .get(api_url(&session, "/wallet/status"))
+        .header("x-api-key", &session.api_key)
+        .header("X-Wallet-Id", "probe")
+        .send()
+        .await
+        .expect("Proxy request (correct key) failed");
+    let status_proxy_ok = resp_proxy_ok.status().as_u16();
+    println!("[proxy] Correct x-api-key: HTTP {}", status_proxy_ok);
+    assert!(
+        status_proxy_ok != 401 && status_proxy_ok != 403,
+        "Proxy must accept the session's own api_key, got {}",
+        status_proxy_ok
+    );
+
+    // ---- DELETE is also gated ----
+
+    // 8. DELETE without a key → 401 (session still alive).
+    let resp_del_no_key = c
+        .delete(format!("{}/sessions/{}", orchestrator_url(), session.id))
+        .send()
+        .await
+        .expect("Delete without key failed");
+    assert_eq!(
+        resp_del_no_key.status().as_u16(),
+        401,
+        "DELETE must reject requests without x-api-key"
+    );
+
+    // 9. DELETE with another session's key → 401.
+    let resp_del_wrong_key = c
+        .delete(format!("{}/sessions/{}", orchestrator_url(), session.id))
+        .header("x-api-key", &other_session.api_key)
+        .send()
+        .await
+        .expect("Delete with wrong key failed");
+    assert_eq!(
+        resp_del_wrong_key.status().as_u16(),
+        401,
+        "DELETE must reject another session's api_key"
+    );
+
+    println!("API key enforcement verified (container + proxy + delete)");
+
+    // Cleanup — both sessions
+    destroy_session(&c, &other_session).await;
     destroy_session(&c, &session).await;
 }
 
@@ -678,6 +773,7 @@ async fn create_custom_token(
 ) -> (String, String) {
     let create_resp: Value = c
         .post(api_url(session, "/wallet/create-token"))
+        .header("x-api-key", &session.api_key)
         .header("X-Wallet-Id", wallet_id)
         .json(&json!({
             "name": name,
@@ -830,6 +926,7 @@ async fn test_token_transfer() {
     println!("\n[step 3] Alice -> Bob: sending 200 TFC...");
     let send_resp: Value = c
         .post(api_url(&session_alice, "/wallet/send-tx"))
+        .header("x-api-key", &session_alice.api_key)
         .header("X-Wallet-Id", "alice")
         .json(&json!({
             "outputs": [{
@@ -872,6 +969,7 @@ async fn test_token_transfer() {
 
     let send_back: Value = c
         .post(api_url(&session_bob, "/wallet/send-tx"))
+        .header("x-api-key", &session_bob.api_key)
         .header("X-Wallet-Id", "bob")
         .json(&json!({
             "outputs": [{
@@ -948,6 +1046,7 @@ async fn test_token_mint() {
     println!("\n[step 3] Minting 500 additional MNT...");
     let mint_resp: Value = c
         .post(api_url(&session, "/wallet/mint-tokens"))
+        .header("x-api-key", &session.api_key)
         .header("X-Wallet-Id", "alice")
         .json(&json!({
             "token": token_uid,
@@ -977,6 +1076,7 @@ async fn test_token_mint() {
     println!("\n[step 4] Minting 200 more MNT...");
     let mint2_resp: Value = c
         .post(api_url(&session, "/wallet/mint-tokens"))
+        .header("x-api-key", &session.api_key)
         .header("X-Wallet-Id", "alice")
         .json(&json!({
             "token": token_uid,
@@ -1047,6 +1147,7 @@ async fn test_token_melt() {
     println!("\n[step 3] Melting 400 MLT...");
     let melt_resp: Value = c
         .post(api_url(&session, "/wallet/melt-tokens"))
+        .header("x-api-key", &session.api_key)
         .header("X-Wallet-Id", "alice")
         .json(&json!({
             "token": token_uid,
@@ -1097,6 +1198,7 @@ async fn test_token_melt() {
     println!("\n[step 4] Melting 200 more MLT...");
     let melt2_resp: Value = c
         .post(api_url(&session, "/wallet/melt-tokens"))
+        .header("x-api-key", &session.api_key)
         .header("X-Wallet-Id", "alice")
         .json(&json!({
             "token": token_uid,
@@ -1194,6 +1296,7 @@ async fn test_token_full_lifecycle() {
     println!("\n[step 3] Minting 300 additional LFC...");
     let mint_resp: Value = c
         .post(api_url(&session_alice, "/wallet/mint-tokens"))
+        .header("x-api-key", &session_alice.api_key)
         .header("X-Wallet-Id", "alice")
         .json(&json!({
             "token": token_uid,
@@ -1214,6 +1317,7 @@ async fn test_token_full_lifecycle() {
     println!("\n[step 4] Alice -> Bob: sending 150 LFC...");
     let send_resp: Value = c
         .post(api_url(&session_alice, "/wallet/send-tx"))
+        .header("x-api-key", &session_alice.api_key)
         .header("X-Wallet-Id", "alice")
         .json(&json!({
             "outputs": [{
@@ -1241,6 +1345,7 @@ async fn test_token_full_lifecycle() {
     println!("\n[step 5] Melting 100 LFC from Alice...");
     let melt_resp: Value = c
         .post(api_url(&session_alice, "/wallet/melt-tokens"))
+        .header("x-api-key", &session_alice.api_key)
         .header("X-Wallet-Id", "alice")
         .json(&json!({
             "token": token_uid,
@@ -1343,6 +1448,7 @@ async fn test_nano_contract_lifecycle() {
     println!("\n[step 2] Publishing on-chain blueprint (Vault)...");
     let ocb_resp: Value = c
         .post(api_url(&session, "/wallet/nano-contracts/create-on-chain-blueprint"))
+        .header("x-api-key", &session.api_key)
         .header("X-Wallet-Id", "alice")
         .json(&json!({
             "code": VAULT_BLUEPRINT.trim(),
@@ -1396,6 +1502,7 @@ async fn test_nano_contract_lifecycle() {
     println!("\n[step 3] Creating nano contract from blueprint...");
     let nc_resp: Value = c
         .post(api_url(&session, "/wallet/nano-contracts/create"))
+        .header("x-api-key", &session.api_key)
         .header("X-Wallet-Id", "alice")
         .json(&json!({
             "blueprint_id": blueprint_id,
@@ -1434,6 +1541,7 @@ async fn test_nano_contract_lifecycle() {
     println!("\n[step 4] Depositing {} into nano contract...", format_htr(100));
     let deposit_resp: Value = c
         .post(api_url(&session, "/wallet/nano-contracts/execute"))
+        .header("x-api-key", &session.api_key)
         .header("X-Wallet-Id", "alice")
         .json(&json!({
             "nc_id": nc_id,
