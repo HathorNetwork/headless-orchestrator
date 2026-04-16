@@ -36,6 +36,8 @@ pub struct AppState {
     pub max_instances: usize,
     /// Idle timeout in seconds
     pub idle_timeout_secs: u64,
+    /// Host used by the proxy to reach spawned containers (see --proxy-host).
+    pub proxy_host: String,
     /// HTTP client for health checks and proxying
     pub http_client: reqwest::Client,
 }
@@ -49,6 +51,7 @@ impl AppState {
         docker_network: Option<String>,
         max_instances: usize,
         idle_timeout_secs: u64,
+        proxy_host: String,
     ) -> Self {
         let http_client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
@@ -65,6 +68,7 @@ impl AppState {
             docker_network,
             max_instances,
             idle_timeout_secs,
+            proxy_host,
             http_client,
         }
     }

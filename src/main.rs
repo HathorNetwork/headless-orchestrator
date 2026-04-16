@@ -43,6 +43,15 @@ struct Args {
     /// Idle timeout in seconds — containers with no requests are killed
     #[arg(long, default_value = "1800")]
     idle_timeout_secs: u64,
+
+    /// Host used to reach spawned wallet-headless containers. Defaults to
+    /// 127.0.0.1 (orchestrator on host). When the orchestrator itself runs
+    /// inside a container but still spawns siblings via the host Docker
+    /// daemon, set this to `host.docker.internal` so the proxy can reach
+    /// the host-published ports. Ignored when `--docker-network` is set
+    /// and containers are reached by name (not yet wired).
+    #[arg(long, default_value = "127.0.0.1")]
+    proxy_host: String,
 }
 
 #[tokio::main]
@@ -65,6 +74,7 @@ async fn main() {
         args.docker_network,
         args.max_instances,
         args.idle_timeout_secs,
+        args.proxy_host,
     ));
 
     // Spawn idle reaper

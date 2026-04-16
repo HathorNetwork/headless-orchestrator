@@ -14,16 +14,24 @@ pub async fn proxy_request(
     headers: &[(String, String)],
 ) -> Result<Response<Body>, (StatusCode, String)> {
     // Look up instance and update last_activity
-    let (port, api_key) = {
+    let (port, container_id, api_key) = {
         let mut instances = state.instances.write().await;
         let instance = instances
             .get_mut(session_id)
             .ok_or((StatusCode::NOT_FOUND, "Session not found".to_string()))?;
         instance.last_activity = std::time::Instant::now();
-        (instance.port, instance.api_key.clone())
+        (instance.port, instance.container_id.clone(), instance.api_key.clone())
     };
 
-    let url = format!("http://127.0.0.1:{}{}", port, path);
+    // When attached to a custom docker network, reach the container by name on
+    // its internal port (8000) — avoids needing host-published ports to be
+    // reachable from the orchestrator's container. Otherwise fall back to
+    // proxy_host:host_port.
+    let url = if state.docker_network.is_some() {
+        format!("http://{}:8000{}", container_id, path)
+    } else {
+        format!("http://{}:{}{}", state.proxy_host, port, path)
+    };
 
     let client = &state.http_client;
     let mut req = client.request(method, &url);

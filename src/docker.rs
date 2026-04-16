@@ -120,8 +120,13 @@ pub async fn spawn_instance(state: &SharedState, session_id: &str) -> Result<Ins
         .map_err(|e| format!("Failed to start container: {}", e))?;
 
     // Wait for the container to be ready by probing the wallet status endpoint
-    // (wallet-headless doesn't have a /health endpoint)
-    let headless_url = format!("http://127.0.0.1:{}", host_port);
+    // (wallet-headless doesn't have a /health endpoint). Same strategy as the
+    // proxy: use the docker network container name when present.
+    let headless_url = if state.docker_network.is_some() {
+        format!("http://{}:8000", container_name)
+    } else {
+        format!("http://{}:{}", state.proxy_host, host_port)
+    };
     let client = &state.http_client;
     let mut ready = false;
     for _ in 0..30 {
