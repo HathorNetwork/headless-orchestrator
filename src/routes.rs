@@ -29,7 +29,12 @@ pub fn create_router(state: SharedState) -> Router {
 }
 
 /// POST /sessions — Spawn a new wallet-headless instance.
-/// Returns { session_id, url } where url is the base URL for proxied requests.
+///
+/// Returns `{ session_id, api_key, message }`. **The caller MUST store the
+/// returned `api_key`** — it is required on every subsequent request to
+/// `/sessions/:session_id/api/*` and on `DELETE /sessions/:session_id`. The
+/// orchestrator does not persist it anywhere the caller can retrieve it
+/// later; if lost, the session is unreachable and must be destroyed & recreated.
 async fn create_session(State(state): State<SharedState>) -> impl IntoResponse {
     // Check capacity
     {
@@ -54,7 +59,7 @@ async fn create_session(State(state): State<SharedState>) -> impl IntoResponse {
             Json(json!({
                 "session_id": session_id,
                 "api_key": api_key,
-                "message": "Wallet-headless instance is ready",
+                "message": "Wallet-headless instance is ready. Store the api_key — it is required on every request to this session and is not recoverable.",
             }))
             .into_response()
         }
@@ -84,10 +89,27 @@ async fn list_sessions(State(state): State<SharedState>) -> impl IntoResponse {
 }
 
 /// DELETE /sessions/:session_id — Destroy a wallet-headless instance.
+///
+/// Requires the caller to present the session's `x-api-key`. Without it (or
+/// with a mismatched key) the orchestrator returns 401, so anyone who only
+/// knows a session_id (e.g. via `GET /sessions`) cannot destroy other callers'
+/// sessions.
 async fn destroy_session(
     State(state): State<SharedState>,
     Path(session_id): Path<String>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
+    let caller_key = headers
+        .get("x-api-key")
+        .and_then(|h| h.to_str().ok())
+        .map(|s| s.to_string());
+
+    if let Err((status, msg)) =
+        proxy::authorize_session(&state, &session_id, caller_key.as_deref()).await
+    {
+        return (status, Json(json!({"error": msg}))).into_response();
+    }
+
     let removed = {
         let mut instances = state.instances.write().await;
         instances.remove(&session_id)
@@ -107,6 +129,9 @@ async fn destroy_session(
 }
 
 /// ANY /sessions/:session_id/api/* — Proxy to the wallet-headless container.
+///
+/// Requires the caller's `x-api-key` to match the session's stored key.
+/// Mismatched/missing keys are rejected with 401 at the proxy edge.
 async fn proxy_handler(
     State(state): State<SharedState>,
     Path((session_id, rest)): Path<(String, String)>,
@@ -125,7 +150,14 @@ async fn proxy_handler(
         format!("/{}?{}", rest, qs.join("&"))
     };
 
-    // Forward relevant headers
+    // Extract the caller-provided api key. Stripped from forwarded headers —
+    // the proxy forwards the stored key itself (see proxy::proxy_request).
+    let caller_api_key = headers
+        .get("x-api-key")
+        .and_then(|h| h.to_str().ok())
+        .map(|s| s.to_string());
+
+    // Forward relevant headers (excluding x-api-key — see above)
     let fwd_headers: Vec<(String, String)> = headers
         .iter()
         .filter(|(name, _)| {
@@ -142,7 +174,17 @@ async fn proxy_handler(
 
     let body_opt = if body.is_empty() { None } else { Some(body) };
 
-    match proxy::proxy_request(&state, &session_id, method, &path, body_opt, &fwd_headers).await {
+    match proxy::proxy_request(
+        &state,
+        &session_id,
+        caller_api_key.as_deref(),
+        method,
+        &path,
+        body_opt,
+        &fwd_headers,
+    )
+    .await
+    {
         Ok(resp) => resp,
         Err((status, msg)) => Response::builder()
             .status(status)
